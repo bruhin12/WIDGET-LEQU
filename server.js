@@ -26,6 +26,9 @@ const SESSION_GAP_MINUTES = Number(process.env.SESSION_GAP_MINUTES || 60);
 
 const HISTORY_COUNT = 10;
 
+// ile meczów pobieramy z API (match ids i potem detale)
+const MATCH_FETCH_COUNT = 16;
+
 /* ================== HTTP ================== */
 function riotHeaders() {
   return { "X-Riot-Token": RIOT_API_KEY };
@@ -81,7 +84,7 @@ async function getLeagueEntriesByPuuid(puuid) {
   );
 }
 
-async function getMatchIdsByPuuid(puuid, count = 16) {
+async function getMatchIdsByPuuid(puuid, count = MATCH_FETCH_COUNT) {
   return riotGet(
     `https://${RIOT_REGIONAL_ROUTING}.api.riotgames.com/lol/match/v5/matches/by-puuid/${encodeURIComponent(
       puuid
@@ -180,70 +183,115 @@ function badgeForTier(tier) {
 }
 
 /* ================== CACHE ================== */
-let CACHE = { updatedAt: 0, data: null, error: null };
+let CACHE = { updatedAt: 0, data: null, error: null, warning: null };
+
+// cache puuid, żeby nie walić account lookup co każde odświeżenie
+let PUUID_CACHE = { puuid: null, updatedAt: 0 };
+const PUUID_TTL_MS = 24 * 60 * 60 * 1000;
+
+async function getPuuidCached() {
+  const now = Date.now();
+  if (PUUID_CACHE.puuid && now - PUUID_CACHE.updatedAt < PUUID_TTL_MS) return PUUID_CACHE.puuid;
+
+  const account = await getAccountByRiotId();
+  if (!account?.puuid) throw new Error("Account lookup failed (no puuid).");
+
+  PUUID_CACHE = { puuid: account.puuid, updatedAt: now };
+  return account.puuid;
+}
+
+// blokada nakładających się refreshy
+let refreshInFlight = null;
 
 async function refresh() {
+  if (refreshInFlight) return refreshInFlight;
+
+  refreshInFlight = (async () => {
+    try {
+      await ensureDdragonVersion();
+
+      const puuid = await getPuuidCached();
+
+      const entries = await getLeagueEntriesByPuuid(puuid);
+      const rank = pickRank(entries);
+
+      const seasonGames = (rank.wins ?? 0) + (rank.losses ?? 0);
+      const seasonWinrateInt = pctInt(rank.wins ?? 0, seasonGames);
+
+      const matchIds = await getMatchIdsByPuuid(puuid, MATCH_FETCH_COUNT);
+
+      // ✅ klucz: NIE robimy Promise.all na 16 meczów naraz
+      const detailed = [];
+      for (const id of (matchIds || []).slice(0, MATCH_FETCH_COUNT)) {
+        detailed.push(await getMatch(id));
+      }
+
+      const parts = detailed.map((m) => extractParticipant(m, puuid)).filter(Boolean);
+
+      const lastN = parts
+        .sort((a, b) => (b.gameStart ?? 0) - (a.gameStart ?? 0))
+        .slice(0, HISTORY_COUNT)
+        .map((p) => ({
+          championName: p.championName,
+          championIcon: champIconUrl(p.championName),
+          win: p.win,
+        }));
+
+      const session = computeSessionByGap(parts);
+
+      CACHE.data = {
+        updatedAt: Date.now(),
+        player: {
+          riotId: `${RIOT_GAME_NAME}#${RIOT_TAG_LINE}`,
+          region: platformToRegionShort(RIOT_PLATFORM_ROUTING),
+        },
+        rank: {
+          ...rank,
+          display: rank.tier === "UNRANKED" ? "UNRANKED" : `${rank.tier} ${rank.rank}`,
+          badge: badgeForTier(rank.tier),
+        },
+        matchHistory: { lastN, count: HISTORY_COUNT },
+        session: {
+          wins: session.wins,
+          losses: session.losses,
+          games: session.games,
+          kda: session.kda,
+          kills: session.kills,
+          deaths: session.deaths,
+          assists: session.assists,
+        },
+        season: {
+          games: seasonGames,
+          winrate: seasonWinrateInt,
+          wins: rank.wins ?? 0,
+          losses: rank.losses ?? 0,
+        },
+      };
+
+      CACHE.error = null;
+      CACHE.warning = null;
+      CACHE.updatedAt = Date.now();
+    } catch (e) {
+      const msg = String(e?.message || e);
+      const is429 = msg.includes("HTTP 429");
+
+      // ✅ jeśli Riot limituje, ale mamy już dane -> nie psujemy ok, tylko warning (i widget dalej działa)
+      if (is429 && CACHE.data) {
+        CACHE.warning = msg;
+        CACHE.updatedAt = Date.now();
+        console.warn("Riot 429 – używam cache");
+        return;
+      }
+
+      CACHE.error = msg;
+      CACHE.updatedAt = Date.now();
+    }
+  })();
+
   try {
-    await ensureDdragonVersion();
-
-    const account = await getAccountByRiotId();
-    if (!account?.puuid) throw new Error("Account lookup failed (no puuid).");
-
-    const entries = await getLeagueEntriesByPuuid(account.puuid);
-    const rank = pickRank(entries);
-
-    const seasonGames = (rank.wins ?? 0) + (rank.losses ?? 0);
-    const seasonWinrateInt = pctInt(rank.wins ?? 0, seasonGames);
-
-    const matchIds = await getMatchIdsByPuuid(account.puuid, 16);
-    const detailed = await Promise.all((matchIds || []).slice(0, 16).map(getMatch));
-    const parts = detailed.map((m) => extractParticipant(m, account.puuid)).filter(Boolean);
-
-    const lastN = parts
-      .sort((a, b) => (b.gameStart ?? 0) - (a.gameStart ?? 0))
-      .slice(0, HISTORY_COUNT)
-      .map((p) => ({
-        championName: p.championName,
-        championIcon: champIconUrl(p.championName),
-        win: p.win,
-      }));
-
-    const session = computeSessionByGap(parts);
-
-    CACHE.data = {
-      updatedAt: Date.now(),
-      player: {
-        riotId: `${RIOT_GAME_NAME}#${RIOT_TAG_LINE}`,
-        region: platformToRegionShort(RIOT_PLATFORM_ROUTING),
-      },
-      rank: {
-        ...rank,
-        display: rank.tier === "UNRANKED" ? "UNRANKED" : `${rank.tier} ${rank.rank}`,
-        badge: badgeForTier(rank.tier),
-      },
-      matchHistory: { lastN, count: HISTORY_COUNT },
-      session: {
-        wins: session.wins,
-        losses: session.losses,
-        games: session.games,
-        kda: session.kda,
-        kills: session.kills,
-        deaths: session.deaths,
-        assists: session.assists,
-      },
-      season: {
-        games: seasonGames,
-        winrate: seasonWinrateInt,
-        wins: rank.wins ?? 0,
-        losses: rank.losses ?? 0,
-      },
-    };
-
-    CACHE.error = null;
-    CACHE.updatedAt = Date.now();
-  } catch (e) {
-    CACHE.error = String(e?.message || e);
-    CACHE.updatedAt = Date.now();
+    await refreshInFlight;
+  } finally {
+    refreshInFlight = null;
   }
 }
 
@@ -251,9 +299,19 @@ await refresh();
 setInterval(refresh, POLL_SECONDS * 1000);
 
 /* ================== ROUTES ================== */
+// ✅ żeby nie było "Cannot GET /"
+app.get("/", (_req, res) => res.redirect("/widget"));
+
 app.get("/widget.json", (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
-  res.json({ ok: !!CACHE.data && !CACHE.error, error: CACHE.error, ...CACHE.data, updatedAt: CACHE.updatedAt });
+  res.json({
+    // ✅ ok = mamy dane, nawet jeśli jest warning (np. 429)
+    ok: !!CACHE.data && !CACHE.error,
+    error: CACHE.error,
+    warning: CACHE.warning,
+    ...CACHE.data,
+    updatedAt: CACHE.updatedAt,
+  });
 });
 
 app.get("/widget", (_req, res) => {
@@ -283,8 +341,8 @@ app.get("/widget", (_req, res) => {
     --padX: 12px;
 
     /* flame */
-    --flameDot: 8px;      /* MALUTKIE */
-    --edgeInset: 2px;     /* jak blisko krawędzi */
+    --flameDot: 8px;
+    --edgeInset: 2px;
   }
 
   html,body{margin:0;background:transparent;font-family:Inter,system-ui,Segoe UI,Arial;color:var(--txt);}
@@ -328,12 +386,9 @@ app.get("/widget", (_req, res) => {
     50%{ opacity:1; filter: blur(0.2px); }
   }
 
-  /* ====== FLAME ON BORDER (OBWÓD) ======
-     Track jest NA KRAWĘDZI (inset minimalny), a flame jest mały i “przyklejony” do borderu.
-  */
   .flameTrack{
     position:absolute;
-    inset: 0;                 /* klucz: nie w środku */
+    inset: 0;
     border-radius: 14px;
     pointer-events:none;
     z-index:3;
@@ -349,7 +404,6 @@ app.get("/widget", (_req, res) => {
     filter: drop-shadow(0 0 10px rgba(78,255,155,0.60)) drop-shadow(0 0 20px rgba(78,255,155,0.20));
   }
 
-  /* głowa */
   .flame:before{
     content:"";
     position:absolute; inset:0;
@@ -361,7 +415,6 @@ app.get("/widget", (_req, res) => {
       rgba(22,200,120,0.0) 100%);
   }
 
-  /* ogon - mały, ciągnie się “za” kierunkiem ruchu */
   .flame:after{
     content:"";
     position:absolute;
@@ -384,9 +437,6 @@ app.get("/widget", (_req, res) => {
     50%{ transform: translate(-50%, -50%) scale(1.08); }
   }
 
-  /* Po obwodzie z uwzględnieniem “edgeInset”
-     W narożnikach obrót zmienia się, żeby ogon wyglądał naturalnie.
-  */
   @keyframes borderOrbit{
     0% {
       left: calc(var(--edgeInset));
@@ -685,7 +735,10 @@ app.get("/widget", (_req, res) => {
 
   async function refresh(){
     const d = await (await fetch("/widget.json", { cache:"no-store" })).json();
-    const err = d.ok ? "" : (d.error || "Brak danych");
+
+    // ✅ nie wyświetlaj błędu jeśli masz dane (np. przy 429)
+    const hasData = !!(d.player && d.rank && d.season);
+    const err = hasData ? "" : (d.error || "Brak danych");
     ["err1","err2","err3","err4","err5"].forEach(id => document.getElementById(id).textContent = err);
 
     document.getElementById("riotId").textContent = d.player?.riotId || "—";

@@ -21,23 +21,47 @@ const RIOT_PLATFORM_ROUTING = requiredEnv("RIOT_PLATFORM_ROUTING"); // euw1
 const RIOT_REGIONAL_ROUTING = requiredEnv("RIOT_REGIONAL_ROUTING"); // europe
 
 const RIOT_RANK_QUEUE = process.env.RIOT_RANK_QUEUE || "RANKED_SOLO_5x5";
+
+// jak często serwer próbuje odświeżyć dane (sekundy)
 const POLL_SECONDS = Number(process.env.POLL_SECONDS || 180);
+
+// po jakiej przerwie uznajesz nową "sesję"
 const SESSION_GAP_MINUTES = Number(process.env.SESSION_GAP_MINUTES || 60);
 
+// ile meczów pokazujesz w historii
 const HISTORY_COUNT = 10;
 
-// ile meczów pobieramy z API (match ids i potem detale)
-const MATCH_FETCH_COUNT = 16;
+// ile meczów pobierasz z API (ids + detale)
+const MATCH_FETCH_COUNT = Number(process.env.MATCH_FETCH_COUNT || 16);
+
+// batch dla pobierania match details (żeby nie walić 16 naraz)
+const MATCH_DETAILS_BATCH = Number(process.env.MATCH_DETAILS_BATCH || 3);
 
 /* ================== HTTP ================== */
 function riotHeaders() {
   return { "X-Riot-Token": RIOT_API_KEY };
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * GET JSON z obsługą Retry-After w message (żeby łatwo wykryć 429)
+ */
 async function httpGetJson(url, headers = {}) {
   const r = await fetch(url, { headers });
+
+  const retryAfter = r.headers?.get?.("retry-after");
+  const retryAfterSec = retryAfter ? Number(retryAfter) : null;
+
   const text = await r.text().catch(() => "");
-  if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}: ${text.slice(0, 250)}`);
+
+  if (!r.ok) {
+    const ra = Number.isFinite(retryAfterSec) ? `; retry-after=${retryAfterSec}` : "";
+    throw new Error(`HTTP ${r.status}${ra} for ${url}: ${text.slice(0, 250)}`);
+  }
+
   try {
     return text ? JSON.parse(text) : null;
   } catch {
@@ -57,6 +81,7 @@ async function ensureDdragonVersion() {
   const now = Date.now();
   if (now - lastDdragonCheck < 12 * 60 * 60 * 1000) return;
   lastDdragonCheck = now;
+
   try {
     const versions = await httpGetJson("https://ddragon.leagueoflegends.com/api/versions.json");
     if (Array.isArray(versions) && versions[0]) DDRAGON_VERSION = versions[0];
@@ -182,10 +207,13 @@ function badgeForTier(tier) {
   return "";
 }
 
-/* ================== CACHE ================== */
+/* ================== CACHE + BACKOFF ================== */
 let CACHE = { updatedAt: 0, data: null, error: null, warning: null };
 
-// cache puuid, żeby nie walić account lookup co każde odświeżenie
+// backoff timestamp: do tego momentu refresh() nic nie robi
+let NEXT_REFRESH_AT = 0;
+
+// cache puuid, żeby nie pytać account za każdym razem
 let PUUID_CACHE = { puuid: null, updatedAt: 0 };
 const PUUID_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -203,7 +231,15 @@ async function getPuuidCached() {
 // blokada nakładających się refreshy
 let refreshInFlight = null;
 
+function parseRetryAfterSeconds(msg) {
+  const m = String(msg).match(/retry-after=(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
 async function refresh() {
+  const now = Date.now();
+  if (now < NEXT_REFRESH_AT) return;
+
   if (refreshInFlight) return refreshInFlight;
 
   refreshInFlight = (async () => {
@@ -212,18 +248,23 @@ async function refresh() {
 
       const puuid = await getPuuidCached();
 
+      // 1) RANK
       const entries = await getLeagueEntriesByPuuid(puuid);
       const rank = pickRank(entries);
 
       const seasonGames = (rank.wins ?? 0) + (rank.losses ?? 0);
       const seasonWinrateInt = pctInt(rank.wins ?? 0, seasonGames);
 
+      // 2) MATCH HISTORY (ids)
       const matchIds = await getMatchIdsByPuuid(puuid, MATCH_FETCH_COUNT);
+      const ids = (matchIds || []).slice(0, MATCH_FETCH_COUNT);
 
-      // ✅ klucz: NIE robimy Promise.all na 16 meczów naraz
+      // 3) MATCH DETAILS — batch po 3, żeby nie robić burstów
       const detailed = [];
-      for (const id of (matchIds || []).slice(0, MATCH_FETCH_COUNT)) {
-        detailed.push(await getMatch(id));
+      for (let i = 0; i < ids.length; i += MATCH_DETAILS_BATCH) {
+        const chunk = ids.slice(i, i + MATCH_DETAILS_BATCH);
+        const res = await Promise.all(chunk.map(getMatch));
+        detailed.push(...res);
       }
 
       const parts = detailed.map((m) => extractParticipant(m, puuid)).filter(Boolean);
@@ -275,12 +316,18 @@ async function refresh() {
       const msg = String(e?.message || e);
       const is429 = msg.includes("HTTP 429");
 
-      // ✅ jeśli Riot limituje, ale mamy już dane -> nie psujemy ok, tylko warning (i widget dalej działa)
-      if (is429 && CACHE.data) {
-        CACHE.warning = msg;
-        CACHE.updatedAt = Date.now();
-        console.warn("Riot 429 – używam cache");
-        return;
+      if (is429) {
+        const ra = parseRetryAfterSeconds(msg);
+        const waitSec = Number.isFinite(ra) ? ra : 60; // fallback
+        NEXT_REFRESH_AT = Date.now() + waitSec * 1000;
+
+        // jeśli mamy dane -> nie psujemy widgetu, tylko warning
+        if (CACHE.data) {
+          CACHE.warning = msg;
+          CACHE.updatedAt = Date.now();
+          console.warn(`Riot 429 → backoff ${waitSec}s → używam cache`);
+          return;
+        }
       }
 
       CACHE.error = msg;
@@ -295,18 +342,18 @@ async function refresh() {
   }
 }
 
+// pierwszy refresh i cykliczne odświeżanie
 await refresh();
 setInterval(refresh, POLL_SECONDS * 1000);
 
 /* ================== ROUTES ================== */
-// ✅ żeby nie było "Cannot GET /"
+// root -> widget
 app.get("/", (_req, res) => res.redirect("/widget"));
 
 app.get("/widget.json", (_req, res) => {
   res.setHeader("Cache-Control", "no-store");
   res.json({
-    // ✅ ok = mamy dane, nawet jeśli jest warning (np. 429)
-    ok: !!CACHE.data && !CACHE.error,
+    ok: !!CACHE.data && !CACHE.error, // warning (np. 429) nie psuje ok
     error: CACHE.error,
     warning: CACHE.warning,
     ...CACHE.data,
@@ -340,7 +387,6 @@ app.get("/widget", (_req, res) => {
     --H: 76px;
     --padX: 12px;
 
-    /* flame */
     --flameDot: 8px;
     --edgeInset: 2px;
   }
@@ -438,51 +484,15 @@ app.get("/widget", (_req, res) => {
   }
 
   @keyframes borderOrbit{
-    0% {
-      left: calc(var(--edgeInset));
-      top: calc(var(--edgeInset));
-      transform: translate(-50%, -50%) rotate(0deg);
-    }
-    24% {
-      left: calc(100% - var(--edgeInset));
-      top: calc(var(--edgeInset));
-      transform: translate(-50%, -50%) rotate(0deg);
-    }
-    25% {
-      left: calc(100% - var(--edgeInset));
-      top: calc(var(--edgeInset));
-      transform: translate(-50%, -50%) rotate(90deg);
-    }
-    49% {
-      left: calc(100% - var(--edgeInset));
-      top: calc(100% - var(--edgeInset));
-      transform: translate(-50%, -50%) rotate(90deg);
-    }
-    50% {
-      left: calc(100% - var(--edgeInset));
-      top: calc(100% - var(--edgeInset));
-      transform: translate(-50%, -50%) rotate(180deg);
-    }
-    74% {
-      left: calc(var(--edgeInset));
-      top: calc(100% - var(--edgeInset));
-      transform: translate(-50%, -50%) rotate(180deg);
-    }
-    75% {
-      left: calc(var(--edgeInset));
-      top: calc(100% - var(--edgeInset));
-      transform: translate(-50%, -50%) rotate(270deg);
-    }
-    99% {
-      left: calc(var(--edgeInset));
-      top: calc(var(--edgeInset));
-      transform: translate(-50%, -50%) rotate(270deg);
-    }
-    100% {
-      left: calc(var(--edgeInset));
-      top: calc(var(--edgeInset));
-      transform: translate(-50%, -50%) rotate(360deg);
-    }
+    0% { left: calc(var(--edgeInset)); top: calc(var(--edgeInset)); transform: translate(-50%, -50%) rotate(0deg); }
+    24%{ left: calc(100% - var(--edgeInset)); top: calc(var(--edgeInset)); transform: translate(-50%, -50%) rotate(0deg); }
+    25%{ left: calc(100% - var(--edgeInset)); top: calc(var(--edgeInset)); transform: translate(-50%, -50%) rotate(90deg); }
+    49%{ left: calc(100% - var(--edgeInset)); top: calc(100% - var(--edgeInset)); transform: translate(-50%, -50%) rotate(90deg); }
+    50%{ left: calc(100% - var(--edgeInset)); top: calc(100% - var(--edgeInset)); transform: translate(-50%, -50%) rotate(180deg); }
+    74%{ left: calc(var(--edgeInset)); top: calc(100% - var(--edgeInset)); transform: translate(-50%, -50%) rotate(180deg); }
+    75%{ left: calc(var(--edgeInset)); top: calc(100% - var(--edgeInset)); transform: translate(-50%, -50%) rotate(270deg); }
+    99%{ left: calc(var(--edgeInset)); top: calc(var(--edgeInset)); transform: translate(-50%, -50%) rotate(270deg); }
+    100%{ left: calc(var(--edgeInset)); top: calc(var(--edgeInset)); transform: translate(-50%, -50%) rotate(360deg); }
   }
 
   .err{
@@ -595,18 +605,8 @@ app.get("/widget", (_req, res) => {
   .mark.win{ color: rgba(78,255,155,0.95); }
   .mark.loss{ color: rgba(255,110,110,0.95); }
 
-  .sessionWL{
-    font-size: 28px;
-    font-weight: 950;
-    letter-spacing:-0.03em;
-    line-height:1;
-  }
-  .sessionKDA{
-    font-size: 21px;
-    font-weight: 950;
-    letter-spacing:-0.02em;
-    line-height:1.1;
-  }
+  .sessionWL{ font-size: 28px; font-weight: 950; letter-spacing:-0.03em; line-height:1; }
+  .sessionKDA{ font-size: 21px; font-weight: 950; letter-spacing:-0.02em; line-height:1.1; }
 
   .wr-red{ color: var(--r); }
   .wr-yellow{ color: var(--y); }
@@ -736,7 +736,7 @@ app.get("/widget", (_req, res) => {
   async function refresh(){
     const d = await (await fetch("/widget.json", { cache:"no-store" })).json();
 
-    // ✅ nie wyświetlaj błędu jeśli masz dane (np. przy 429)
+    // ✅ nie pokazuj błędu, jeśli masz dane (np. Riot 429 w tle)
     const hasData = !!(d.player && d.rank && d.season);
     const err = hasData ? "" : (d.error || "Brak danych");
     ["err1","err2","err3","err4","err5"].forEach(id => document.getElementById(id).textContent = err);
